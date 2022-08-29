@@ -1,0 +1,535 @@
+---
+title: '1'
+author: "Yo"
+date: "25/8/2022"
+output: pdf_document
+---
+
+```{r, include=FALSE}
+library(SummarizedExperiment)
+library(DESeq2)
+library(dplyr)
+library("AnnotationDbi")
+library("org.Hs.eg.db")
+library(biomaRt)
+library(ggrepel)
+library("clusterProfiler")
+library("enrichplot")
+library("ggnewscale")
+library(pheatmap)
+library(DOSE)
+library(KEGGgraph)
+library(MetaboSignal)
+library(tidyr)
+library(edgeR)
+```
+
+Datos de expresión génica
+```{r, results='asis'}
+load("C:/Users/Ivan/Desktop/MASTER/TFM/GeneExpression.RData")
+```
+
+Agrupación de las muestras
+```{r, include = TRUE}
+library(readxl)
+muestras <- read_excel("C:/Users/Ivan/Desktop/MASTER/TFM/Analysis of Gene Expression and Alternative Splicing of MDS Samples and its Transition to AML.xlsx")
+library(dplyr)
+muestras <- muestras %>% 
+  mutate(Grupo = case_when(`WHO` == 'CMML-1' ~ 'Grupo 1', 
+                            `WHO` == 'CMML-2' ~ 'Grupo 1',
+                            `WHO` == 'RAEB-1' ~ 'Grupo 2',
+                             `WHO` == 'RAEB-2' ~ 'Grupo 2',
+                            `WHO` == 'RARS' ~ 'Grupo 3',
+                            `WHO` == 'RARS-T' ~ 'Grupo 3',
+                            `WHO` == 'RCMD' ~ 'Grupo 4',
+                            `WHO` == 'RCMD-RS' ~ 'Grupo 4',
+                            `WHO` == 'AML-MDS' ~ 'Grupo 5',
+                            `WHO` == 'MDS/MPN-U' ~ 'Grupo 1')) %>%
+                            #`WHO` == 'MDSdel(5q)' ~ 'Grupo 5',
+                            #`WHO` == 'RCUD' ~ 'Grupo 3'))  %>%
+  drop_na(Grupo) #Eliminar muestras a las que no se asigna grupo
+# La columna grupo se usará para crear las matrices de contraste
+```
+
+```{r}
+GENEXP <- GeneExpression[ ,!colnames(GeneExpression) %in% c("PV830_CD34","normal1_CD34", "normal2_CD34", "normal3_CD34")]
+# Eliminar las muestras para las cuales existen registros de expresión génica pero no historial clínico, puesto que no se conoce su subtipo
+```
+
+Las correspondencias entre el id de las muestras y la notación de GeneExpression se encuentra en summaryinfo. Este archivo es necesario para poder asignar los grupos de cada muestra de forma que no existan errores.
+
+```{r, echo = TRUE, results='hide'}
+load("C:/Users/Ivan/Desktop/MASTER/TFM/summaryinfo.RData")
+nombres <- summaryinfo[,c("ID","kallistooutput")]
+nombres <- nombres[order(nombres$ID),]
+nombres2 <- na.omit(nombres) #Dataframe ordenado que relaciona ambas notaciones
+```
+
+```{r, echo = TRUE, results = 'hide'}
+muestrasordenadas <- muestras[order(muestras$ID),]
+gruposordenados <- muestrasordenadas$Grupo
+#El archivo con el historial clínico se ordena de la misma forma para poder asignar los grupos
+```
+
+```{r, echo = TRUE, results = 'hide'}
+RNADATAtraspuesto <- as.data.frame(t(GENEXP))
+gsubRNADATA <- gsub("PV|_CD34","",rownames(RNADATAtraspuesto))
+rownames(RNADATAtraspuesto) <- gsubRNADATA
+RNADATAordenado <- RNADATAtraspuesto[order(as.numeric(row.names(RNADATAtraspuesto))), ]
+RNA2 <- RNADATAordenado[rownames(RNADATAordenado) %in% muestras$ID, ]
+#Ordenación de los registros de expresión génica de acuerdo a lo visto anteriormente
+```
+
+```{r, echo = TRUE, results='hide'}
+#Añadir al final de la matriz el grupo de cada muestra
+RNADATAfinal <- cbind(RNA2, gruposordenados)
+RNADATAfinal$gruposordenados <-  as.character(RNADATAfinal$gruposordenados)
+```
+
+```{r, include = TRUE}
+#Eliminar muestras con expresión genética defectuosa
+muestrasdelete <- c("1130","1103","1121","1158") #IDs conocidas de antemano
+RNADATAfinal2 <- RNADATAfinal[!(row.names(RNADATAfinal) %in% muestrasdelete),]
+gruposordenados2 <- as.character(RNADATAfinal2[, ncol(RNADATAfinal2)])
+RNADATAfinal2 <- RNADATAfinal2[1:(length(RNADATAfinal2)-1)] 
+matrizDESeq <- as.data.frame(t(RNADATAfinal2))
+```
+
+```{r, include = TRUE}
+library(limma)
+designmatrix <- model.matrix(~0+gruposordenados2, data = RNADATAfinal2) #Matriz de diseño
+colnames(designmatrix) <- gsub("gruposordenados2Grupo","G",colnames(designmatrix))
+colnames(designmatrix) <- make.names(colnames(designmatrix))
+contrastmatrix <- makeContrasts(G.1-G.2, G.1-G.3, G.1-G.4, G.1-G.5, G.2-G.3, G.2-G.4, G.2-G.5, G.3-G.4, G.3-G.5, G.4-G.5, levels = colnames(designmatrix)) #Matriz de contraste
+```
+
+
+```{r}
+dataset <- DGEList(matrizDESeq)
+dataset$samples$group <- gruposordenados2
+
+keep.exprs <- filterByExpr(dataset, group=gruposordenados2)
+dataset <- dataset[keep.exprs,, keep.lib.sizes=FALSE]
+dataset <- calcNormFactors(dataset, method = "TMM")
+
+v <- voom(dataset, designmatrix, plot = TRUE)
+vfitrobust <- lmFit(v, designmatrix, method = "robust")
+vfitrobust <- contrasts.fit(vfitrobust, contrasts = contrastmatrix)
+efitrobust <- eBayes(vfitrobust)
+dtrobust <- decideTests(efitrobust) #Método robusto debido a la posibilidad de más muestras erróneas
+
+# DIAGRAMA DE VENN
+venn1 <- vennDiagram(dtrobust[,1:4], circle.col = c("red", "blue", "green", "purple"))
+venn2 <- vennDiagram(dtrobust[,c(1,5,6,7)], circle.col = c("red", "blue", "green", "purple"))
+venn3 <- vennDiagram(dtrobust[,c(2,5,8,9)], circle.col = c("red", "blue", "green", "purple"))
+venn4 <- vennDiagram(dtrobust[,c(3,6,8,10)], circle.col = c("red", "blue", "green", "purple"))
+venn5 <- vennDiagram(dtrobust[,c(4,7,9,10)], circle.col = c("red", "blue", "green", "purple"))
+
+xx1 <- list(g12 = dtrobust[,1], g13 = dtrobust[,2], g14 = dtrobust[,3], g15 = dtrobust[,4])
+xxstack <- list(A = sample(LETTERS, 15), 
+             B = sample(LETTERS, 15), 
+             C = sample(LETTERS, 15), 
+             D = sample(LETTERS, 15))
+x1 <- which(dtrobust[,1]!=0)#Separar genes significativos
+x11 <- rownames(dataset)[x1]
+x2 <- which(dtrobust[,2]!=0)
+x22 <- rownames(dataset)[x2]
+x3 <- which(dtrobust[,3]!=0)
+x33 <- rownames(dataset)[x3]
+x4 <- which(dtrobust[,4]!=0)
+x44 <- rownames(dataset)[x4]
+x5 <- which(dtrobust[,5]!=0)
+x55 <- rownames(dataset)[x5]
+x6 <- which(dtrobust[,6]!=0)
+x66 <- rownames(dataset)[x6]
+x7 <- which(dtrobust[,7]!=0)
+x77 <- rownames(dataset)[x7]
+x8 <- which(dtrobust[,8]!=0)
+x88 <- rownames(dataset)[x8]
+x9 <- which(dtrobust[,9]!=0)
+x99 <- rownames(dataset)[x9]
+x10 <- which(dtrobust[,10]!=0)
+x1010 <- rownames(dataset)[x10]
+
+library(VennDiagram) #Guardar imágenes de los diagramas de venn
+colors <- c("#6b7fff", "#c3db0f", "#ff4059", "#2cff21")
+v1 <- venn.diagram(x = list(x11, x22, x33, x44) ,
+            category.names = c("G.1-G.2", "G.1-G.3","G.1-G.4","G.1-G.5"),
+            filename = 'venn1.tiff',
+            output=TRUE,
+            imagetype="tiff", 
+            scaled = FALSE,
+            col = "black",
+            fill = colors,
+            cat.col = colors,
+            cat.cex = 2,
+            margin = 0.15
+)
+
+v2 <- venn.diagram(x = list(x11, x55, x66, x77) ,
+            category.names = c("G.1-G.2", "G.2-G.3","G.2-G.4","G.2-G.5"),
+            filename = 'venn2.tiff',
+            output=TRUE,
+            imagetype="tiff", 
+            scaled = FALSE,
+            col = "black",
+            fill = colors,
+            cat.col = colors,
+            cat.cex = 2,
+            margin = 0.15
+)
+
+v3 <- venn.diagram(x = list(x22, x55, x88, x99) ,
+            category.names = c("G.1-G.3", "G.2-G.3","G.3-G.4","G.3-G.5"),
+            filename = 'venn3.tiff',
+            output=TRUE,
+            imagetype="tiff", 
+            scaled = FALSE,
+            col = "black",
+            fill = colors,
+            cat.col = colors,
+            cat.cex = 2,
+            margin = 0.15
+)
+
+v4 <- venn.diagram(x = list(x33, x66, x88, x1010) ,
+            category.names = c("G.1-G.4", "G.2-G.4","G.3-G.4","G.4-G.5"),
+            filename = 'venn4.tiff',
+            output=TRUE,
+            imagetype="tiff", 
+            scaled = FALSE,
+            col = "black",
+            fill = colors,
+            cat.col = colors,
+            cat.cex = 2,
+            margin = 0.15
+)
+
+v5 <- venn.diagram(x = list(x44, x77, x99, x1010) ,
+            category.names = c("G.1-G.5", "G.2-G.5","G.3-G.5","G.4-G.5"),
+            filename = 'venn5.tiff',
+            output=TRUE,
+            imagetype="tiff", 
+            scaled = FALSE,
+            col = "black",
+            fill = colors,
+            cat.col = colors,
+            cat.cex = 2,
+            margin = 0.15
+)
+library(VennDiagram)
+venn1 <- calculate.overlap(x = list("g12" = x11, "g13" = x22, "g14" = x33, "g15" = x44))
+names(venn1) <- c("a1234", "a123", "a124", "a134", "a234", "a12", "a13", "a14", "a23", "a24", "a34", "a1", "a2", "a3", "a4")
+venn2 <- calculate.overlap(x = list("g12" = x11, "g23" = x55, "24" = x66, "g25" = x77))
+names(venn2) <- c("a1234", "a123", "a124", "a134", "a234", "a12", "a13", "a14", "a23", "a24", "a34", "a1", "a2", "a3", "a4")
+venn3 <- calculate.overlap(x = list("g13" = x22, "g23" = x55, "34" = x88, "g35" = x99))
+names(venn3) <- c("a1234", "a123", "a124", "a134", "a234", "a12", "a13", "a14", "a23", "a24", "a34", "a1", "a2", "a3", "a4")
+venn4 <- calculate.overlap(x = list("g14" = x33, "g24" = x66, "34" = x88, "g45" = x1010))
+names(venn4) <- c("a1234", "a123", "a124", "a134", "a234", "a12", "a13", "a14", "a23", "a24", "a34", "a1", "a2", "a3", "a4")
+venn5 <- calculate.overlap(x = list("g15" = x44, "g25" = x77, "35" = x99, "g45" = x1010))
+names(venn5) <- c("a1234", "a123", "a124", "a134", "a234", "a12", "a13", "a14", "a23", "a24", "a34", "a1", "a2", "a3", "a4")
+```
+
+```{R}
+OrgDb <- org.Hs.eg.db
+join1 <- c(pruebavenn[["a1234"]], pruebavenn[["a123"]], pruebavenn[["a124"]],pruebavenn[["a134"]], pruebavenn[["a234"]])
+join2 <- c(venn2[["a1234"]], venn2[["a123"]], venn2[["a124"]],venn2[["a134"]], venn2[["a234"]])
+join3 <- c(venn3[["a1234"]], venn3[["a123"]], venn3[["a124"]],venn3[["a134"]], venn3[["a234"]])
+join4 <- c(venn4[["a1234"]], venn4[["a123"]], venn4[["a124"]],venn4[["a134"]], venn4[["a234"]])
+join5 <- c(venn5[["a1234"]], venn5[["a123"]], venn5[["a124"]],venn5[["a134"]], venn5[["a234"]])
+join1 <- bitr(join1, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = OrgDb, drop = FALSE)
+join1 <- join1[!duplicated(join1$SYMBOL),]
+join1 <- join1$ENTREZID
+pruebaenrichkegg <- enrichKEGG(gene = join1,
+                         organism = "hsa",
+                         keyType = "ncbi-geneid")
+join2 <- bitr(join2, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = OrgDb, drop = FALSE)
+join2 <- join2[!duplicated(join2$SYMBOL),]
+join2 <- join2$ENTREZID
+enrichkegg2 <- enrichKEGG(gene = join2,
+                         organism = "hsa",
+                         keyType = "ncbi-geneid")
+join3 <- bitr(join3, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = OrgDb, drop = TRUE)
+join3 <- join3[!duplicated(join3$SYMBOL),]
+join3 <- join3$ENTREZID
+enrichkegg3 <- enrichKEGG(gene = join3,
+                         organism = "hsa",
+                         keyType = "ncbi-geneid")
+join4 <- bitr(join4, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = OrgDb, drop = TRUE)
+join4 <- join4[!duplicated(join4$SYMBOL),]
+join4 <- join4$ENTREZID
+enrichkegg4 <- enrichKEGG(gene = join4,
+                         organism = "hsa",
+                         keyType = "ncbi-geneid")
+join5 <- bitr(join5, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = OrgDb, drop = TRUE)
+join5 <- join5[!duplicated(join4$SYMBOL),]
+join5 <- join5$ENTREZID
+enrichkegg5 <- enrichKEGG(gene = join5,
+                         organism = "hsa",
+                         keyType = "ncbi-geneid")
+#cnetplot(enrichkegg5)
+```
+
+```{r}
+down1 <- which(dtrobust[,1]=="-1") # Separar significativamente positivos y negativos
+down1nam <- rownames(dataset)[down1]
+down2 <- which(dtrobust[,2]=="-1")
+down2nam <- rownames(dataset)[down2]
+down3 <- which(dtrobust[,3]=="-1")
+down3nam <- rownames(dataset)[down3]
+down4 <- which(dtrobust[,4]=="-1")
+down4nam <- rownames(dataset)[down4]
+down5 <- which(dtrobust[,5]=="-1")
+down5nam <- rownames(dataset)[down5]
+
+up1 <- which(dtrobust[,1]=="1")
+up1nam <- rownames(dataset)[up1]
+up2 <- which(dtrobust[,2]=="1")
+up2nam <- rownames(dataset)[up2]
+up3 <- which(dtrobust[,3]=="1")
+up3nam <- rownames(dataset)[up3]
+up4 <- which(dtrobust[,4]=="1")
+up4nam <- rownames(dataset)[up4]
+up5 <- which(dtrobust[,5]=="1")
+up5nam <- rownames(dataset)[up5]
+
+#options(clusterProfiler.download.method = "wininet")
+```
+
+```{r}
+options(clusterProfiler.download.method = "wininet")
+OrgDb <- org.Hs.eg.db
+library(stats)
+
+tt1 <- topTable(efitrobust[,1], n=nrow(efitrobust[,1]))
+b1 <- as.vector((-log10(tt1$P.Value))*sign(tt1$logFC)) # Signed fold change * log10 pvalue
+# ranks <- -log1o(pvalue) * sign(logfc)
+names(b1) <- rownames(tt1)
+b11up <- sort(b1, decreasing = TRUE) # Genes significativamente positivos arriba y negativos abajo
+b11down <- sort(b1, decreasing = FALSE)
+
+gse1up <- gseGO(geneList = b11up, ##### Gene Set Enrichment Analysis of GO terms
+                OrgDb = OrgDb,
+                ont = "ALL",
+                pAdjustMethod = "BH",
+                keyType = "SYMBOL",
+                minGSSize = 10,
+                pvalueCutoff = 0.01,
+               eps = 0,
+               nPermSimple = 10000)
+
+gse1upres <- gse1up@result
+#save(gse1upres, file = "C:/Users/Ivan/Desktop/MASTER/TFM/res/gse1upres.RData")
+
+EG_IDs_1 <- bitr(names(b11up), fromType = "SYMBOL", toType = "ENTREZID", OrgDb = OrgDb, drop = FALSE) # Cambiar formato a ENTREZID
+egids1 <- EG_IDs_1[!duplicated(EG_IDs_1$SYMBOL),]
+aaa1 <- cbind(b11up, egids1)
+aaa11 <- aaa1[!is.na(aaa1$ENTREZID),] # Eliminar los genes sin ENTREZID 
+z1 <- aaa11$b11up
+names(z1) <- aaa11$ENTREZID # Entrezids con el score que les corresponde según el ranking
+
+kegg1 <- gseKEGG(geneList = z1,  ##### Gene Set Enrichment Analysis of KEGG
+                organism = "hsa",
+                pAdjustMethod = "BH",
+                keyType = "ncbi-geneid",
+                pvalueCutoff = 0.05,
+               eps = 0)
+
+kegg1res <- kegg1@result
+#save(kegg1res, file = "C:/Users/Ivan/Desktop/MASTER/TFM/res/kegg1res.RData")
+```
+
+```{r}
+tt2 <- topTable(efitrobust[,2], n=nrow(efitrobust[,2]))
+b2 <- as.vector((-log10(tt2$P.Value))*sign(tt2$logFC))
+names(b2) <- rownames(tt2)
+b22up <- sort(b2, decreasing = TRUE)
+b22down <- sort(b2, decreasing = FALSE)
+
+gse2up <- gseGO(geneList = b22up,
+                OrgDb = OrgDb,
+                ont = "ALL",
+                pAdjustMethod = "BH",
+                keyType = "SYMBOL",
+                minGSSize = 10,
+                pvalueCutoff = 0.01,
+               eps = 0,
+               nPermSimple = 10000)
+
+gse2upres <- gse2up@result
+#save(gse2upres, file = "C:/Users/Ivan/Desktop/MASTER/TFM/res/gse2upres.RData")
+
+EG_IDs_2 <- bitr(names(b22up), fromType = "SYMBOL", toType = "ENTREZID", OrgDb = OrgDb, drop = FALSE)
+egids2 <- EG_IDs_2[!duplicated(EG_IDs_2$SYMBOL),]
+aaa2 <- cbind(b22up, egids2)
+aaa22 <- aaa2[!is.na(aaa2$ENTREZID),]
+z2 <- aaa22$b22up
+names(z2) <- aaa22$ENTREZID
+
+kegg2 <- gseKEGG(geneList = z2,
+                organism = "hsa",
+                pAdjustMethod = "BH",
+                keyType = "ncbi-geneid",
+                pvalueCutoff = 0.05,
+               eps = 0)
+
+kegg2res <- kegg2@result
+#save(kegg2res, file = "C:/Users/Ivan/Desktop/MASTER/TFM/res/kegg2res.RData")
+```
+
+```{r}
+tt3 <- topTable(efitrobust[,3], n=nrow(efitrobust[,3]))
+b3 <- as.vector((-log10(tt3$P.Value))*sign(tt3$logFC))
+names(b3) <- rownames(tt3)
+b33up <- sort(b3, decreasing = TRUE)
+b33down <- sort(b3, decreasing = FALSE)
+
+gse3up <- gseGO(geneList = b33up,
+                OrgDb = OrgDb,
+                ont = "ALL",
+                pAdjustMethod = "BH",
+                keyType = "SYMBOL",
+                minGSSize = 10,
+                pvalueCutoff = 0.01,
+               eps = 0,
+               nPermSimple = 10000)
+
+gse3upres <- gse3up@result
+#save(gse3upres, file = "C:/Users/Ivan/Desktop/MASTER/TFM/res/gse3upres.RData")
+
+EG_IDs_3 <- bitr(names(b33up), fromType = "SYMBOL", toType = "ENTREZID", OrgDb = OrgDb, drop = FALSE)
+egids3 <- EG_IDs_3[!duplicated(EG_IDs_3$SYMBOL),]
+aaa3 <- cbind(b33up, egids3)
+aaa33 <- aaa3[!is.na(aaa3$ENTREZID),]
+z3 <- aaa33$b33up
+names(z3) <- aaa33$ENTREZID
+
+kegg3 <- gseKEGG(geneList = z3,
+                organism = "hsa",
+                pAdjustMethod = "BH",
+                keyType = "ncbi-geneid",
+                pvalueCutoff = 0.05,
+               eps = 0)
+
+kegg3res <- kegg3@result
+#save(kegg3res, file = "C:/Users/Ivan/Desktop/MASTER/TFM/res/kegg3res.RData")
+```
+
+```{r}
+tt4 <- topTable(efitrobust[,4], n=nrow(efitrobust[,4]))
+b4 <- as.vector((-log10(tt4$P.Value))*sign(tt4$logFC))
+names(b4) <- rownames(tt4)
+b44up <- sort(b4, decreasing = TRUE)
+b44down <- sort(b4, decreasing = FALSE)
+
+gse4up <- gseGO(geneList = b44up,
+                OrgDb = OrgDb,
+                ont = "ALL",
+                pAdjustMethod = "BH",
+                keyType = "SYMBOL",
+                minGSSize = 10,
+                pvalueCutoff = 0.01,
+               eps = 0,
+               nPermSimple = 10000)
+
+gse4upres <- gse4up@result
+#save(gse4upres, file = "C:/Users/Ivan/Desktop/MASTER/TFM/res/gse4upres.RData")
+
+EG_IDs_4 <- bitr(names(b44up), fromType = "SYMBOL", toType = "ENTREZID", OrgDb = OrgDb, drop = FALSE)
+egids4 <- EG_IDs_4[!duplicated(EG_IDs_4$SYMBOL),]
+aaa4 <- cbind(b44up, egids4)
+aaa44 <- aaa4[!is.na(aaa4$ENTREZID),]
+z4 <- aaa44$b44up
+names(z4) <- aaa44$ENTREZID
+
+kegg4 <- gseKEGG(geneList = z4,
+                organism = "hsa",
+                pAdjustMethod = "BH",
+                keyType = "ncbi-geneid",
+                pvalueCutoff = 0.05,
+               eps = 0)
+
+kegg4res <- kegg4@result
+#save(kegg4res, file = "C:/Users/Ivan/Desktop/MASTER/TFM/res/kegg4res.RData")
+```
+
+```{r}
+tt5 <- topTable(efitrobust[,5], n=nrow(efitrobust[,5]))
+b5 <- as.vector((-log10(tt5$P.Value))*sign(tt5$logFC))
+names(b5) <- rownames(tt5)
+b55up <- sort(b5, decreasing = TRUE)
+b55down <- sort(b5, decreasing = FALSE)
+
+gse5up <- gseGO(geneList = b55up,
+                OrgDb = OrgDb,
+                ont = "ALL",
+                pAdjustMethod = "BH",
+                keyType = "SYMBOL",
+                minGSSize = 10,
+                pvalueCutoff = 0.01,
+               eps = 0,
+               nPermSimple = 10000)
+
+gse5upres <- gse5up@result
+#save(gse5upres, file = "C:/Users/Ivan/Desktop/MASTER/TFM/res/gse5upres.RData")
+
+EG_IDs_5 <- bitr(names(b55up), fromType = "SYMBOL", toType = "ENTREZID", OrgDb = OrgDb, drop = FALSE)
+egids5 <- EG_IDs_5[!duplicated(EG_IDs_4$SYMBOL),]
+aaa5 <- cbind(b55up, egids5)
+aaa55 <- aaa5[!is.na(aaa5$ENTREZID),]
+z5 <- aaa55$b55up
+names(z5) <- aaa55$ENTREZID
+
+kegg5 <- gseKEGG(geneList = z5,
+                organism = "hsa",
+                pAdjustMethod = "BH",
+                keyType = "ncbi-geneid",
+                pvalueCutoff = 0.05,
+               eps = 0)
+
+kegg5res <- kegg5@result
+#save(kegg5res, file = "C:/Users/Ivan/Desktop/MASTER/TFM/res/kegg5res.RData")
+```
+
+```{r}
+# Separar positivos y negativos, en este caso en el grupo 5
+load(file = "C:/Users/Ivan/Desktop/MASTER/TFM/res/gse5upres.RData")
+gse5upres <- gse5upres
+gse5upres$ID <- NULL
+gse5upres$setSize <- NULL
+gse5upres$enrichmentScore <- NULL
+gse5upres$pvalue <- NULL
+
+gse5upresup <- gse5upres[which(gse5upres$NES > 0),]
+gse5downres <- gse5upres[which(gse5upres$NES < 0),]
+#kable(gse5upresup[,1:4], digits = 3,caption = "Res...")
+#kable(gse5downres[,1:4], digits = 3,caption = "Res...")
+
+load(file = "C:/Users/Ivan/Desktop/MASTER/TFM/res/kegg5res.RData")
+kegg5res <- kegg5res
+kegg5res$ID <- NULL
+kegg5res$setSize <- NULL
+kegg5res$enrichmentScore <- NULL
+kegg5res$pvalue <- NULL
+
+kegg5upres <- kegg5res[which(kegg5res$NES > 0),]
+kegg5downres <- kegg5res[which(kegg5res$NES < 0),]
+# kable(kegg1upres[,1:4], digits = 3, caption = "kegg sobrerres") 
+# kable(kegg1downres[,1:4], digits = 3, caption = "kegg infrarres")
+```
+
+```{r}
+library(rrvgo)
+simMatrix5down <- calculateSimMatrix(gse5downres$ID,
+                                orgdb="org.Hs.eg.db",
+                                ont="BP",
+                                method="Rel")
+scores5 <- setNames(-log10(gse5downres$qvalues), gse5downres$ID)
+reducedTerms <- reduceSimMatrix(simMatrix5down,
+                                scores5,
+                                threshold=0.7,
+                                orgdb="org.Hs.eg.db")
+options(ggrepel.max.overlaps = 25)
+#scatterPlot(simMatrix5down, reducedTerms)
+#treemapPlot(reducedTerms)
+```
