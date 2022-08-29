@@ -1,0 +1,525 @@
+---
+title: '2'
+author: "Yo"
+date: "28/8/2022"
+output: pdf_document
+---
+
+````{r, include=FALSE}
+library(SummarizedExperiment)
+library(DESeq2)
+library(dplyr)
+library("AnnotationDbi")
+library("org.Hs.eg.db")
+library(biomaRt)
+library(ggrepel)
+library("clusterProfiler")
+library("enrichplot")
+library("ggnewscale")
+library(pheatmap)
+library(DOSE)
+library(KEGGgraph)
+library(MetaboSignal)
+library(tidyr)
+library(edgeR)
+```
+
+```{r, results='asis'}
+load("C:/Users/Ivan/Desktop/MASTER/TFM/GeneExpression.RData")
+```
+
+```{r, include = TRUE}
+library(readxl)
+muestras <- read_excel("C:/Users/Ivan/Desktop/MASTER/TFM/Analysis of Gene Expression and Alternative Splicing of MDS Samples and its Transition to AML.xlsx")
+library(dplyr)
+muestras <- muestras %>% 
+  mutate(Grupo = case_when(`WHO` == 'CMML-1' ~ 'Grupo 1', 
+                            `WHO` == 'CMML-2' ~ 'Grupo 1',
+                            `WHO` == 'RAEB-1' ~ 'Grupo 2',
+                             `WHO` == 'RAEB-2' ~ 'Grupo 2',
+                            `WHO` == 'RARS' ~ 'Grupo 3',
+                            `WHO` == 'RARS-T' ~ 'Grupo 3',
+                            `WHO` == 'RCMD' ~ 'Grupo 4',
+                            `WHO` == 'RCMD-RS' ~ 'Grupo 4',
+                            `WHO` == 'AML-MDS' ~ 'Grupo 5',
+                            `WHO` == 'MDS/MPN-U' ~ 'Grupo 1')) %>%
+                            #`WHO` == 'MDSdel(5q)' ~ 'Grupo 5',
+                            #`WHO` == 'RCUD' ~ 'Grupo 3'))  %>%
+  drop_na(Grupo) 
+```
+
+De cara a facilitar el hacer pruebas con agrupaciones diferentes, he hecho que se elimine automáticamente cualquier muestra a la que no se le asigne un grupo.
+
+Se ha obtenido una columna con la cual segmentar las muestras. Con esto se pueden obtener las matrices de contraste. Antes de unir la columna con los grupos se han de eliminar las muestras para las cuales existen registros de expresión génica pero no historial clínico, puesto que no se puede saber a que subtipo de síndrome mielodisplásico corresponden.
+
+```{r}
+GENEXP <- GeneExpression[ ,!colnames(GeneExpression) %in% c("PV830_CD34","normal1_CD34", "normal2_CD34", "normal3_CD34")]
+```
+
+Las correspondencias entre el id de las muestras y la notación de GeneExpression se encuentra en summaryinfo. Este archivo es necesario para poder asignar los grupos de cada muestra de forma que no existan errores.
+
+```{r, echo = TRUE, results='hide'}
+load("C:/Users/Ivan/Desktop/MASTER/TFM/summaryinfo.RData")
+nombres <- summaryinfo[,c("ID","kallistooutput")]
+nombres <- nombres[order(nombres$ID),]
+nombres2 <- na.omit(nombres)
+```
+
+```{r, echo = TRUE, results = 'hide'}
+muestrasordenadas <- muestras[order(muestras$ID),]
+gruposordenados <- muestrasordenadas$Grupo
+```
+
+
+```{r, echo = TRUE, results = 'hide'}
+RNADATAtraspuesto <- as.data.frame(t(GENEXP))
+gsubRNADATA <- gsub("PV|_CD34","",rownames(RNADATAtraspuesto))
+rownames(RNADATAtraspuesto) <- gsubRNADATA
+RNADATAordenado <- RNADATAtraspuesto[order(as.numeric(row.names(RNADATAtraspuesto))), ]
+RNA2 <- RNADATAordenado[rownames(RNADATAordenado) %in% muestras$ID, ]
+```
+
+Ahora que esta ordenado, se puede añadir al final de la matriz el grupo de cada muestra
+
+```{r, echo = TRUE, results='hide'}
+RNADATAfinal <- cbind(RNA2, gruposordenados)
+RNADATAfinal$gruposordenados <-  as.character(RNADATAfinal$gruposordenados)
+```
+
+```{r, include = TRUE}
+muestrasdelete <- c("1130","1103","1121","1158")
+RNADATAfinal2 <- RNADATAfinal[!(row.names(RNADATAfinal) %in% muestrasdelete),]
+gruposordenados2 <- as.character(RNADATAfinal2[, ncol(RNADATAfinal2)])
+RNADATAfinal2 <- RNADATAfinal2[1:(length(RNADATAfinal2)-1)] # sigue siendo numeric
+matrizDESeq <- as.data.frame(t(RNADATAfinal2))
+# matrizDESeq[] <- lapply(matrizDESeq, function(x) as.numeric(x)) 
+# matrizDESeq <- head(matrizDESeq, - 1)
+# nas <- cbind(lapply(lapply(matrizDESeq, is.na), sum))
+```
+
+
+```{r, include = TRUE}
+library(limma)
+designmatrix <- model.matrix(~0+gruposordenados2, data = RNADATAfinal2)
+colnames(designmatrix) <- gsub("gruposordenados2Grupo","G",colnames(designmatrix))
+colnames(designmatrix) <- make.names(colnames(designmatrix))
+contrastmatrix <- makeContrasts(G.1-G.2, G.1-G.3, G.1-G.4, G.1-G.5, G.2-G.3, G.2-G.4, G.2-G.5, G.3-G.4, G.3-G.5, G.4-G.5, levels = colnames(designmatrix))
+```
+
+```{r}
+dataset <- DGEList(matrizDESeq)
+dataset$samples$group <- gruposordenados2
+
+keep.exprs <- filterByExpr(dataset, group=gruposordenados2)
+dataset <- dataset[keep.exprs,, keep.lib.sizes=FALSE]
+dataset <- calcNormFactors(dataset, method = "TMM")
+
+v <- voom(dataset, designmatrix, plot = TRUE)
+vfitrobust <- lmFit(v, designmatrix, method = "robust")
+vfitrobust <- contrasts.fit(vfitrobust, contrasts = contrastmatrix)
+efitrobust <- eBayes(vfitrobust)
+dtrobust <- decideTests(efitrobust)
+
+library(tidyr)
+g1 <- which(gruposordenados2 == "Grupo 1")
+g2 <- which(gruposordenados2 == "Grupo 2")
+g3 <- which(gruposordenados2 == "Grupo 3")
+g4 <- which(gruposordenados2 == "Grupo 4")
+g5 <- which(gruposordenados2 == "Grupo 5")
+
+df1 <- matrizDESeq[,g1]
+df2 <- matrizDESeq[,g2]
+df3 <- matrizDESeq[,g3]
+df4 <- matrizDESeq[,g4]
+df5 <- matrizDESeq[,g5]# quitable
+
+#library(GeneSelector)
+df12 <- cbind(df1,df2)
+#altrank12 <- Rank
+
+# DIAGRAMA DE VENN
+#venn1 <- VennDiagram::venn.diagram(x = list(which(dtrobust[,1]!=0), which(dtrobust[,2]!=0), which(dtrobust[,3]!=0), which(dtrobust[,4]!=0)), filename = NULL)
+
+venn1 <- vennDiagram(dtrobust[,1:4], circle.col = c("red", "blue", "green", "purple"))
+#venn1counts <- vennCounts(dtrobust[,1:4])
+#mygenes <- apply(dtrobust[,1:4],1,all)
+library(venneuler)
+MyVenn <- venneuler(c(A=74344,B=33197,C=26464,D=148531,"A&B"=11797, 
+                       "A&C"=9004,"B&C"=6056,"A&B&C"=2172,"A&D"=0,"A&D"=0,"B&D"=0,"C&D"=0))
+venn2 <- vennDiagram(dtrobust[,c(1,5,6,7)], circle.col = c("red", "blue", "green", "purple"))
+venn3 <- vennDiagram(dtrobust[,c(2,5,8,9)], circle.col = c("red", "blue", "green", "purple"))
+venn4 <- vennDiagram(dtrobust[,c(3,6,8,10)], circle.col = c("red", "blue", "green", "purple"))
+venn5 <- vennDiagram(dtrobust[,c(4,7,9,10)], circle.col = c("red", "blue", "green", "purple"))
+
+xx1 <- list(g12 = dtrobust[,1], g13 = dtrobust[,2], g14 = dtrobust[,3], g15 = dtrobust[,4])
+xxstack <- list(A = sample(LETTERS, 15), 
+             B = sample(LETTERS, 15), 
+             C = sample(LETTERS, 15), 
+             D = sample(LETTERS, 15))
+x1 <- which(dtrobust[,1]!=0)
+x11 <- rownames(dataset)[x1]
+x2 <- which(dtrobust[,2]!=0)
+x22 <- rownames(dataset)[x2]
+x3 <- which(dtrobust[,3]!=0)
+x33 <- rownames(dataset)[x3]
+x4 <- which(dtrobust[,4]!=0)
+x44 <- rownames(dataset)[x4]
+x5 <- which(dtrobust[,5]!=0)
+x55 <- rownames(dataset)[x5]
+x6 <- which(dtrobust[,6]!=0)
+x66 <- rownames(dataset)[x6]
+x7 <- which(dtrobust[,7]!=0)
+x77 <- rownames(dataset)[x7]
+x8 <- which(dtrobust[,8]!=0)
+x88 <- rownames(dataset)[x8]
+x9 <- which(dtrobust[,9]!=0)
+x99 <- rownames(dataset)[x9]
+x10 <- which(dtrobust[,10]!=0)
+x1010 <- rownames(dataset)[x10]
+#pruebavenn <- calculate.overlap(x = list(g12 = dtrobust[,1], g13 = dtrobust[,2], g14 = dtrobust[,3], g15 = dtrobust[,4]))
+library(VennDiagram)
+pruebavenn <- calculate.overlap(x = list("g12" = x11, "g13" = x22, "g14" = x33, "g15" = x44))
+names(pruebavenn) <- c("a1234", "a123", "a124", "a134", "a234", "a12", "a13", "a14", "a23", "a24", "a34", "a1", "a2", "a3", "a4")
+venn2 <- calculate.overlap(x = list("g12" = x11, "g23" = x55, "24" = x66, "g25" = x77))
+names(venn2) <- c("a1234", "a123", "a124", "a134", "a234", "a12", "a13", "a14", "a23", "a24", "a34", "a1", "a2", "a3", "a4")
+venn3 <- calculate.overlap(x = list("g13" = x22, "g23" = x55, "34" = x88, "g35" = x99))
+names(venn3) <- c("a1234", "a123", "a124", "a134", "a234", "a12", "a13", "a14", "a23", "a24", "a34", "a1", "a2", "a3", "a4")
+venn4 <- calculate.overlap(x = list("g14" = x33, "g24" = x66, "34" = x88, "g45" = x1010))
+names(venn4) <- c("a1234", "a123", "a124", "a134", "a234", "a12", "a13", "a14", "a23", "a24", "a34", "a1", "a2", "a3", "a4")
+venn5 <- calculate.overlap(x = list("g15" = x44, "g25" = x77, "35" = x99, "g45" = x1010))
+names(venn5) <- c("a1234", "a123", "a124", "a134", "a234", "a12", "a13", "a14", "a23", "a24", "a34", "a1", "a2", "a3", "a4")
+```
+
+Grupos 1-2 
+
+```{r}
+OrgDb <- org.Hs.eg.db
+
+library(stats)
+
+tt12 <- topTable(efitrobust[,1], n=nrow(efitrobust[,1]))
+bbb <- as.vector(tt12$P.Value)
+names(bbb) <- rownames(tt12)
+#bbb <- bbb[order(bbb, decreasing = TRUE),,drop=FALSE]
+bbb <- sort(abs(bbb), decreasing = FALSE)
+bbb2 <- 1-bbb
+# pval12 <- as.vector(tt12$adj.P.Val)
+# names(pval12) <- rownames(tt12)
+# inv12 <- -log10(pval12)
+# sign12 <- sign(tt12$logFC)
+# metric12 <- inv12/sign12
+# metricalt12 <- inv12*abs(tt12$logFC)
+
+gse12 <- gseGO(geneList = bbb2,
+                OrgDb = OrgDb,
+                ont = "ALL",
+                pAdjustMethod = "BH",
+                keyType = "SYMBOL",
+                minGSSize = 10,
+                pvalueCutoff = 0.05,
+               eps = 0,
+               nPermSimple = 10000)
+dotplot(gse12, showCategory = 10)
+
+
+# fc12 <- rownames(tt12)[which(abs(tt12$logFC) > 2)]
+# fc12
+# 
+# adj12 <- rownames(tt12)[which(tt12$adj.P.Val < 0.05)]
+# adj12
+
+EG_IDs <- bitr(names(bbb2), fromType = "SYMBOL", toType = "ENTREZID", OrgDb = OrgDb, drop = FALSE)
+egids <- EG_IDs[!duplicated(EG_IDs$SYMBOL),]
+aaa <- cbind(bbb2, egids)
+aaa <- aaa[!is.na(aaa$ENTREZID),]
+zzz <- aaa$bbb
+names(zzz) <- aaa$ENTREZID
+kegg12 <- gseKEGG(geneList = zzz,
+                organism = "hsa",
+                pAdjustMethod = "BH",
+                keyType = "ncbi-geneid",
+                pvalueCutoff = 0.05,
+               eps = 0)
+#cnetplot(kegg12)
+```
+
+Grupo 1-3
+
+```{r}
+tt13 <- topTable(efitrobust[,2], n=nrow(efitrobust[,2]))
+bbb13 <- as.vector(tt13$P.Value)
+names(bbb13) <- rownames(tt13)
+bbbfg13 <- sort(abs(bbb13), decreasing = FALSE)
+bbb213 <- 1-bbbfg13
+gse13 <- gseGO(geneList = bbb213,
+                OrgDb = OrgDb,
+                ont = "ALL",
+                pAdjustMethod = "BH",
+                keyType = "SYMBOL",
+                minGSSize = 10,
+                pvalueCutoff = 0.05,
+               eps = 0,
+               nPermSimple = 10000)
+EG_IDs13 <- bitr(names(bbb213), fromType = "SYMBOL", toType = "ENTREZID", OrgDb = OrgDb, drop = FALSE)
+egids13 <- EG_IDs13[!duplicated(EG_IDs13$SYMBOL),]
+aaa13 <- cbind(bbb213, egids13)
+aaa213 <- aaa13[!is.na(aaa13$ENTREZID),]
+zzz13 <- aaa213$bbb213
+names(zzz13) <- aaa213$ENTREZID
+kegg13 <- gseKEGG(geneList = zzz13,
+                organism = "hsa",
+                pAdjustMethod = "BH",
+                keyType = "ncbi-geneid",
+                pvalueCutoff = 0.05,
+               eps = 0)
+```
+
+Grupo 1-4
+
+```{r}
+tt14 <- topTable(efitrobust[,3], n=nrow(efitrobust[,3]))
+bbb14 <- as.vector(tt14$P.Value)
+names(bbb14) <- rownames(tt14)
+bbbfg14 <- sort(abs(bbb14), decreasing = FALSE)
+bbb214 <- 1-bbbfg14
+gse14 <- gseGO(geneList = bbb214,
+                OrgDb = OrgDb,
+                ont = "ALL",
+                pAdjustMethod = "BH",
+                keyType = "SYMBOL",
+                minGSSize = 10,
+                pvalueCutoff = 0.05,
+               eps = 0,
+               nPermSimple = 10000)
+EG_IDs14 <- bitr(names(bbb214), fromType = "SYMBOL", toType = "ENTREZID", OrgDb = OrgDb, drop = FALSE)
+egids14 <- EG_IDs14[!duplicated(EG_IDs14$SYMBOL),]
+aaa14 <- cbind(bbb214, egids14)
+aaa214 <- aaa14[!is.na(aaa14$ENTREZID),]
+zzz14 <- aaa214$bbb214
+names(zzz14) <- aaa214$ENTREZID
+kegg14 <- gseKEGG(geneList = zzz14,
+                organism = "hsa",
+                pAdjustMethod = "BH",
+                keyType = "ncbi-geneid",
+                pvalueCutoff = 0.05,
+               eps = 0)
+```
+
+Grupo 1-5
+
+```{r}
+tt15 <- topTable(efitrobust[,4], n=nrow(efitrobust[,4]))
+bbb15 <- as.vector(tt15$P.Value)
+names(bbb15) <- rownames(tt15)
+bbbfg15 <- sort(abs(bbb15), decreasing = FALSE)
+bbb215 <- 1-bbbfg15
+gse15 <- gseGO(geneList = bbb215,
+                OrgDb = OrgDb,
+                ont = "ALL",
+                pAdjustMethod = "BH",
+                keyType = "SYMBOL",
+                minGSSize = 10,
+                pvalueCutoff = 0.05,
+               eps = 0,
+               nPermSimple = 10000)
+EG_IDs15 <- bitr(names(bbb215), fromType = "SYMBOL", toType = "ENTREZID", OrgDb = OrgDb, drop = FALSE)
+egids15 <- EG_IDs15[!duplicated(EG_IDs15$SYMBOL),]
+aaa15 <- cbind(bbb215, egids15)
+aaa215 <- aaa15[!is.na(aaa15$ENTREZID),]
+zzz15 <- aaa215$bbb215
+names(zzz15) <- aaa215$ENTREZID
+kegg15 <- gseKEGG(geneList = zzz15,
+                organism = "hsa",
+                pAdjustMethod = "BH",
+                keyType = "ncbi-geneid",
+                pvalueCutoff = 0.05,
+               eps = 0)
+```
+
+
+Grupo 2-3
+
+```{r}
+tt23 <- topTable(efitrobust[,5], n=nrow(efitrobust[,5]))
+bbb23 <- as.vector(tt23$P.Value)
+names(bbb23) <- rownames(tt23)
+bbbfg23 <- sort(abs(bbb23), decreasing = FALSE)
+bbb223 <- 1-bbbfg23
+gse23 <- gseGO(geneList = bbb223,
+                OrgDb = OrgDb,
+                ont = "ALL",
+                pAdjustMethod = "BH",
+                keyType = "SYMBOL",
+                minGSSize = 10,
+                pvalueCutoff = 0.05,
+               eps = 0,
+               nPermSimple = 10000)
+EG_IDs23 <- bitr(names(bbb223), fromType = "SYMBOL", toType = "ENTREZID", OrgDb = OrgDb, drop = FALSE)
+egids23 <- EG_IDs23[!duplicated(EG_IDs23$SYMBOL),]
+aaa23 <- cbind(bbb223, egids23)
+aaa223 <- aaa23[!is.na(aaa23$ENTREZID),]
+zzz23 <- aaa223$bbb223
+names(zzz23) <- aaa223$ENTREZID
+kegg23 <- gseKEGG(geneList = zzz23,
+                organism = "hsa",
+                pAdjustMethod = "BH",
+                keyType = "ncbi-geneid",
+                pvalueCutoff = 0.05,
+               eps = 0)
+```
+
+
+Grupo 2-4
+
+```{r}
+tt24 <- topTable(efitrobust[,6], n=nrow(efitrobust[,6]))
+bbb24 <- as.vector(tt24$P.Value)
+names(bbb24) <- rownames(tt24)
+bbbfg24 <- sort(abs(bbb24), decreasing = FALSE)
+bbb224 <- 1-bbbfg24
+gse24 <- gseGO(geneList = bbb224,
+                OrgDb = OrgDb,
+                ont = "ALL",
+                pAdjustMethod = "BH",
+                keyType = "SYMBOL",
+                minGSSize = 10,
+                pvalueCutoff = 0.05,
+               eps = 0,
+               nPermSimple = 10000)
+EG_IDs24 <- bitr(names(bbb224), fromType = "SYMBOL", toType = "ENTREZID", OrgDb = OrgDb, drop = FALSE)
+egids24<- EG_IDs24[!duplicated(EG_IDs24$SYMBOL),]
+aaa24 <- cbind(bbb224, egids24)
+aaa224 <- aaa24[!is.na(aaa24$ENTREZID),]
+zzz24 <- aaa224$bbb224
+names(zzz24) <- aaa224$ENTREZID
+kegg24 <- gseKEGG(geneList = zzz24,
+                organism = "hsa",
+                pAdjustMethod = "BH",
+                keyType = "ncbi-geneid",
+                pvalueCutoff = 0.05,
+               eps = 0)
+```
+
+Grupo 2-5
+
+```{r}
+tt25 <- topTable(efitrobust[,7], n=nrow(efitrobust[,7]))
+bbb25 <- as.vector(tt25$P.Value)
+names(bbb25) <- rownames(tt25)
+bbbfg25 <- sort(abs(bbb25), decreasing = FALSE)
+bbb225 <- 1-bbbfg25
+gse25 <- gseGO(geneList = bbb225,
+                OrgDb = OrgDb,
+                ont = "ALL",
+                pAdjustMethod = "BH",
+                keyType = "SYMBOL",
+                minGSSize = 10,
+                pvalueCutoff = 0.05,
+               eps = 0,
+               nPermSimple = 10000)
+EG_IDs25 <- bitr(names(bbb225), fromType = "SYMBOL", toType = "ENTREZID", OrgDb = OrgDb, drop = FALSE)
+egids25<- EG_IDs25[!duplicated(EG_IDs25$SYMBOL),]
+aaa25 <- cbind(bbb225, egids25)
+aaa225 <- aaa25[!is.na(aaa25$ENTREZID),]
+zzz25 <- aaa225$bbb225
+names(zzz25) <- aaa225$ENTREZID
+kegg25 <- gseKEGG(geneList = zzz25,
+                organism = "hsa",
+                pAdjustMethod = "BH",
+                keyType = "ncbi-geneid",
+                pvalueCutoff = 0.05,
+               eps = 0)
+```
+
+Grupo 3-4
+
+```{r}
+tt34 <- topTable(efitrobust[,8], n=nrow(efitrobust[,8]))
+bbb34 <- as.vector(tt34$P.Value)
+names(bbb34) <- rownames(tt34)
+bbbfg34 <- sort(abs(bbb34), decreasing = FALSE)
+bbb234 <- 1-bbbfg34
+gse34 <- gseGO(geneList = bbb234,
+                OrgDb = OrgDb,
+                ont = "ALL",
+                pAdjustMethod = "BH",
+                keyType = "SYMBOL",
+                minGSSize = 10,
+                pvalueCutoff = 0.05,
+               eps = 0,
+               nPermSimple = 10000)
+EG_IDs34 <- bitr(names(bbb234), fromType = "SYMBOL", toType = "ENTREZID", OrgDb = OrgDb, drop = FALSE)
+egids34<- EG_IDs34[!duplicated(EG_IDs34$SYMBOL),]
+aaa34 <- cbind(bbb234, egids34)
+aaa234 <- aaa34[!is.na(aaa34$ENTREZID),]
+zzz34 <- aaa234$bbb234
+names(zzz34) <- aaa234$ENTREZID
+kegg34 <- gseKEGG(geneList = zzz34,
+                organism = "hsa",
+                pAdjustMethod = "BH",
+                keyType = "ncbi-geneid",
+                pvalueCutoff = 0.05,
+               eps = 0)
+```
+
+Grupo 3-5
+
+```{r}
+tt35 <- topTable(efitrobust[,9], n=nrow(efitrobust[,9]))
+bbb35 <- as.vector(tt35$P.Value)
+names(bbb35) <- rownames(tt35)
+bbbfg35 <- sort(abs(bbb35), decreasing = FALSE)
+bbb235 <- 1-bbbfg35
+gse35 <- gseGO(geneList = bbb235,
+                OrgDb = OrgDb,
+                ont = "ALL",
+                pAdjustMethod = "BH",
+                keyType = "SYMBOL",
+                minGSSize = 10,
+                pvalueCutoff = 0.05,
+               eps = 0,
+               nPermSimple = 10000)
+EG_IDs35 <- bitr(names(bbb235), fromType = "SYMBOL", toType = "ENTREZID", OrgDb = OrgDb, drop = FALSE)
+egids35<- EG_IDs35[!duplicated(EG_IDs35$SYMBOL),]
+aaa35 <- cbind(bbb235, egids35)
+aaa235 <- aaa35[!is.na(aaa35$ENTREZID),]
+zzz35 <- aaa235$bbb235
+names(zzz35) <- aaa235$ENTREZID
+kegg35 <- gseKEGG(geneList = zzz35,
+                organism = "hsa",
+                pAdjustMethod = "BH",
+                keyType = "ncbi-geneid",
+                pvalueCutoff = 0.05,
+               eps = 0)
+```
+
+Grupo 4-5
+
+```{r}
+tt45 <- topTable(efitrobust[,10], n=nrow(efitrobust[,10]))
+bbb45 <- as.vector(tt45$P.Value)
+names(bbb45) <- rownames(tt45)
+bbbfg45 <- sort(abs(bbb45), decreasing = FALSE)
+bbb245 <- 1-bbbfg45
+gse45 <- gseGO(geneList = bbb245,
+                OrgDb = OrgDb,
+                ont = "ALL",
+                pAdjustMethod = "BH",
+                keyType = "SYMBOL",
+                minGSSize = 10,
+                pvalueCutoff = 0.05,
+               eps = 0,
+               nPermSimple = 10000)
+EG_IDs45 <- bitr(names(bbb245), fromType = "SYMBOL", toType = "ENTREZID", OrgDb = OrgDb, drop = FALSE)
+egids45<- EG_IDs45[!duplicated(EG_IDs45$SYMBOL),]
+aaa45 <- cbind(bbb245, egids45)
+aaa245 <- aaa45[!is.na(aaa45$ENTREZID),]
+zzz45 <- aaa245$bbb245
+names(zzz45) <- aaa245$ENTREZID
+kegg45 <- gseKEGG(geneList = zzz45,
+                organism = "hsa",
+                pAdjustMethod = "BH",
+                keyType = "ncbi-geneid",
+                pvalueCutoff = 0.05,
+               eps = 0)
+```
